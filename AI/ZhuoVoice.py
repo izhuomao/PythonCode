@@ -12,6 +12,9 @@ from http import HTTPStatus
 import requests
 from datetime import datetime
 
+# ▼▼▼ 新增：导入情感记忆模块 ▼▼▼
+from EmotionSystem import EmotionSystem
+
 # ==========================================
 #              1. 全局配置区
 # ==========================================
@@ -73,7 +76,16 @@ SYSTEM_PROMPT = """
 2. 回复控制在100字左右，重要信息可以适当多说一些，但不要超过150字。
 """
 
-history_messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+# ▼▼▼ 新增：初始化情感系统 ▼▼▼
+emotion = EmotionSystem()
+
+
+def build_system_prompt():
+    """每次对话前，重新拼接 System Prompt（加入最新情感状态）"""
+    return SYSTEM_PROMPT + emotion.get_emotion_prompt() + emotion.get_sentiment_instruction()
+
+
+history_messages = [{'role': 'system', 'content': build_system_prompt()}]
 
 
 # ==========================================
@@ -91,9 +103,11 @@ def get_weather():
         print(f"天气获取失败: {e}")
         return "未知", "--"
 
+
 def get_current_time():
     now = datetime.now()
     return now.strftime("%H点%M分"), now.strftime("%Y年%m月%d日")
+
 
 def generate_cosyvoice_tts(text_content):
     print(f"   [TTS] CosyVoice 正在合成: {text_content[:30]}...")
@@ -147,6 +161,17 @@ def parse_memo_and_text(full_reply):
     return memo, text
 
 
+# ▼▼▼ 新增：解析 sentiment 标签 ▼▼▼
+def parse_sentiment_and_text(full_reply):
+    sentiment = "neutral"
+    text = full_reply
+    match = re.search(r"\[sentiment:(positive|neutral|negative)\]", full_reply)
+    if match:
+        sentiment = match.group(1)
+        text = re.sub(r"\[sentiment:\w+\]", "", text).strip()
+    return sentiment, text
+
+
 def send_audio_to_esp32(sock, pcm_data, addr):
     print(f"   [发送] 回传音频 ({len(pcm_data)} bytes)...")
     chunk_size = 1024
@@ -166,6 +191,16 @@ def send_memo_to_esp32(sock, memo_dict, addr):
         print(f"   📤 备忘录已发送给 ESP32: {memo_json[:80]}...")
     except Exception as e:
         print(f"   ❌ 发送备忘录失败: {e}")
+
+
+# ▼▼▼ 新增：发送情感数据包给 ESP32 ▼▼▼
+def send_emotion_to_esp32(sock, addr):
+    try:
+        emo_packet = emotion.get_emo_packet()
+        sock.sendto(emo_packet.encode('utf-8'), addr)
+        print(f"   💖 情感数据已发送: {emo_packet}")
+    except Exception as e:
+        print(f"   ❌ 发送情感数据失败: {e}")
 
 
 def call_qwen_llm(user_text):
@@ -197,6 +232,10 @@ def call_qwen_llm(user_text):
         enriched_text = "\n".join(context_parts) + "\n用户说：" + user_text
 
     print(f"   [大脑] 思考中...")
+
+    # ▼▼▼ 修改：每次对话前更新 System Prompt（注入最新情感状态） ▼▼▼
+    history_messages[0] = {'role': 'system', 'content': build_system_prompt()}
+
     history_messages.append({'role': 'user', 'content': enriched_text})
     try:
         response = Generation.call(
@@ -212,7 +251,7 @@ def call_qwen_llm(user_text):
             return ai_content
     except Exception as e:
         print(f"LLM Error: {e}")
-    return "喵...系统出错啦 [action:4]"
+    return "喵...系统出错啦 [action:4] [sentiment:neutral]"
 
 
 def run_aliyun_asr(wav_file_path):
@@ -232,22 +271,13 @@ def run_aliyun_asr(wav_file_path):
     return ""
 
 
-# ▼▼▼ 新增：处理 REMIND 提醒请求（跳过 ASR 和 LLM，直接 TTS） ▼▼▼
 def handle_remind_request(sock, remind_text, addr):
-    """
-    处理来自 ESP32 的备忘录提醒请求
-    直接将文本合成语音并回传，不经过 ASR/LLM
-    """
     print(f"\n🔔 [提醒] 收到备忘录提醒请求: {remind_text}")
-
-    # 1. 包装成茁猫风格的提醒语
     speak_text = f"主人主人！茁猫提醒你，{remind_text}，别忘了喵！"
     print(f"   🐱 提醒语音: {speak_text}")
 
-    # 2. 发送动作指令（22 = 提醒表情动作）
     sock.sendto(b"CMD:22", addr)
 
-    # 3. 合成 TTS
     wav_bytes = generate_cosyvoice_tts(speak_text)
     if wav_bytes:
         with open("temp_remind.wav", "wb") as f:
@@ -270,20 +300,28 @@ if __name__ == '__main__':
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
 
-    print(f"🚀 茁猫(备忘录+提醒版)已启动! 端口: {UDP_PORT}")
+    print(f"🚀 茁猫(备忘录+提醒+情感记忆版)已启动! 端口: {UDP_PORT}")
     print(f"🔊 音色: {TTS_VOICE} | 模型: {TTS_MODEL}")
+    print(f"💖 当前情感: mood={emotion.mood}, intimacy={emotion.intimacy}, 状态={emotion.get_mood_state()}")
 
     audio_data = bytearray()
     is_receiving = False
 
     while True:
         try:
-            data, addr = sock.recvfrom(2048)  # 增大缓冲区以容纳提醒文本
+            data, addr = sock.recvfrom(2048)
 
-            # ▼▼▼ 新增：处理 REMIND 提醒包（来自 ESP32） ▼▼▼
+            # 处理 REMIND 提醒包
             if data.startswith(b"REMIND:"):
                 remind_text = data[7:].decode('utf-8', errors='replace')
                 handle_remind_request(sock, remind_text, addr)
+
+            # ▼▼▼ 新增：处理 APP 互动通知（手机遥控也加分） ▼▼▼
+            elif data.startswith(b"APP_INTERACT"):
+                print("📱 [情感] 收到 APP 互动通知，更新情感...")
+                emotion.update_on_interaction("neutral")  # APP 遥控按 neutral 算
+                send_emotion_to_esp32(sock, addr)
+                print(f"📱 [情感] 更新完毕: mood={emotion.mood}, intimacy={emotion.intimacy}")
 
             elif data.startswith(b"START"):
                 print("\n🔵 [状态] 正在听...")
@@ -305,17 +343,27 @@ if __name__ == '__main__':
                         print(f"👂 听见: {text_in}")
                         full_reply = call_qwen_llm(text_in)
 
-                        memo, reply_without_memo = parse_memo_and_text(full_reply)
+                        # ▼▼▼ 修改：先解析 sentiment，再解析 memo 和 action ▼▼▼
+                        sentiment, reply_no_sentiment = parse_sentiment_and_text(full_reply)
+                        memo, reply_without_memo = parse_memo_and_text(reply_no_sentiment)
                         action_id, talk_text = parse_action_and_text(reply_without_memo)
 
+                        # ▼▼▼ 新增：更新情感状态 ▼▼▼
+                        emotion.update_on_interaction(sentiment)
+
+                        # 发送动作指令
                         cmd_msg = f"CMD:{action_id}".encode()
                         sock.sendto(cmd_msg, addr)
+
+                        # ▼▼▼ 新增：发送情感数据包给 ESP32 ▼▼▼
+                        send_emotion_to_esp32(sock, addr)
 
                         if memo:
                             send_memo_to_esp32(sock, memo, addr)
 
                         print("-" * 40)
-                        print(f"🐱 茁猫: {talk_text} | 💖 动作:{action_id}")
+                        print(f"🐱 茁猫: {talk_text} | 💖 动作:{action_id} | 情绪:{sentiment}")
+                        print(f"💖 情感状态: mood={emotion.mood}({emotion.get_mood_state()}), intimacy={emotion.intimacy}")
                         if memo:
                             print(f"📝 备忘: {memo['title']} @ {memo['time']}")
                         print("-" * 40)
